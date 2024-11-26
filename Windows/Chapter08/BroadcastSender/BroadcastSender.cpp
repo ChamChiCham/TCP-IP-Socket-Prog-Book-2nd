@@ -52,8 +52,8 @@ int main(int argc, char *argv[])
 		retval = sendto(sock, buf, (int)strlen(buf), 0,
 			(struct sockaddr *)&remoteaddr, sizeof(remoteaddr));
 		if (retval == SOCKET_ERROR) {
-			err_display("sendto()");
-			break;
+			// err_display("sendto()");
+			// break;
 		}
 		printf("[UDP] %d바이트를 보냈습니다.\n", retval);
 	}

@@ -1,24 +1,41 @@
 #include "..\..\Common.h"
 #include "resource.h"
 
+#include <fstream>
+#include <string>
+
+#include <commctrl.h>
+#include <shlwapi.h>
+#pragma comment(lib, "Shlwapi.lib")
+
+
 #define SERVERIP   "127.0.0.1"
 #define SERVERPORT 9000
 #define BUFSIZE    512
 
 // 대화상자 프로시저
 INT_PTR CALLBACK DlgProc(HWND, UINT, WPARAM, LPARAM);
-// 에디트 컨트롤 출력 함수
-void DisplayText(const char *fmt, ...);
-// 소켓 함수 오류 출력
-void DisplayError(const char *msg);
-// 소켓 통신 스레드 함수
-DWORD WINAPI ClientMain(LPVOID arg);
 
-SOCKET sock; // 소켓
-char buf[BUFSIZE + 1]; // 데이터 송수신 버퍼
-HANDLE hReadEvent, hWriteEvent; // 이벤트
-HWND hSendButton; // 보내기 버튼
-HWND hEdit1, hEdit2; // 에디트 컨트롤
+// 소켓 통신 스레드 함수
+DWORD WINAPI workerSend(LPVOID arg);
+
+// 네트워크
+SOCKET		sock{NULL};  // 소켓
+char		ipAddress[INET_ADDRSTRLEN];  // 아이피 주소 저장 버퍼
+char		buf[BUFSIZE + 1];  // 데이터 송수신 버퍼
+std::string path;  // 파일 경로
+std::string filename;  // 파일 이름
+double		maxSize;  // 전송 중인 파일 최대 크기
+double		currentSize;  // 전송 중인 파일 현재 크기 
+
+
+
+// 윈도우 핸들 
+HWND hSendButton, hFileButton; // 보내기 버튼
+HWND hFileEdit, hStatusEdit; // 파일 이름 에디트
+HWND hIpAddress; // 파일 선택 에디트 컨트롤
+HWND hProgress; // 프로그레스 바
+
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
 	LPSTR lpCmdLine, int nCmdShow)
@@ -28,19 +45,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
 	if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0)
 		return 1;
 
-	// 이벤트 생성
-	hReadEvent = CreateEvent(NULL, FALSE, TRUE, NULL);
-	hWriteEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
-
-	// 소켓 통신 스레드 생성
-	CreateThread(NULL, 0, ClientMain, NULL, 0, NULL);
-
 	// 대화상자 생성
 	DialogBox(hInstance, MAKEINTRESOURCE(IDD_DIALOG1), NULL, DlgProc);
-
-	// 이벤트 제거
-	CloseHandle(hReadEvent);
-	CloseHandle(hWriteEvent);
 
 	// 윈속 종료
 	WSACleanup();
@@ -52,25 +58,82 @@ INT_PTR CALLBACK DlgProc(HWND hDlg, UINT uMsg, WPARAM wParam, LPARAM lParam)
 {
 	switch (uMsg) {
 	case WM_INITDIALOG:
-		hEdit1 = GetDlgItem(hDlg, IDC_EDIT1);
-		hEdit2 = GetDlgItem(hDlg, IDC_EDIT2);
-		hSendButton = GetDlgItem(hDlg, IDOK);
-		SendMessage(hEdit1, EM_SETLIMITTEXT, BUFSIZE, 0);
+		
+		// 아이템 초기화
+		hFileButton	= GetDlgItem(hDlg, IDC_FILE_BUTTON);
+		hSendButton	= GetDlgItem(hDlg, IDC_SEND_BUTTON);
+		hIpAddress	= GetDlgItem(hDlg, IDC_IP_CONTROL);
+		hProgress	= GetDlgItem(hDlg, IDC_PROGRESS_BAR);
+		hFileEdit	= GetDlgItem(hDlg, IDC_FILE_EDIT);
+		hStatusEdit = GetDlgItem(hDlg, IDC_STATUS_EDIT);
+
+		// 프로그레스 바 초기 설정
+		SendMessage(hProgress, PBM_SETRANGE, 0, MAKELPARAM(0, 100));	// 범위 설정 (0 ~ 100)
+		SendMessage(hProgress, PBM_SETSTEP, (WPARAM)1, 0);				// 단계 설정
+
 		return TRUE;
+
 	case WM_COMMAND:
 		switch (LOWORD(wParam)) {
-		case IDOK:
-			EnableWindow(hSendButton, FALSE); // 보내기 버튼 비활성화
-			WaitForSingleObject(hReadEvent, INFINITE); // 읽기 완료 대기
-			GetDlgItemTextA(hDlg, IDC_EDIT1, buf, BUFSIZE + 1);
-			SetEvent(hWriteEvent); // 쓰기 완료 알림
-			SetFocus(hEdit1); // 키보드 포커스 전환
-			SendMessage(hEdit1, EM_SETSEL, 0, -1); // 텍스트 전체 선택
+		case IDC_SEND_BUTTON:
+		{
+			// 보내기 버튼 비활성화
+			EnableWindow(hSendButton, FALSE);
+
+			// IpAddress에서 IP를 가져온다.
+			DWORD ip;
+			SendMessage(hIpAddress, IPM_GETADDRESS, 0, (LPARAM)&ip);
+			BYTE b1 = FIRST_IPADDRESS(ip);
+			BYTE b2 = SECOND_IPADDRESS(ip);
+			BYTE b3 = THIRD_IPADDRESS(ip);
+			BYTE b4 = FOURTH_IPADDRESS(ip);
+			sprintf(ipAddress, "%d.%d.%d.%d", b1, b2, b3, b4);
+
+			// 가져온 IP로 파일을 보내는 쓰레드를 만든다.
+			auto th{ CreateThread(NULL, 0, workerSend, NULL, 0, NULL) };
+			if (NULL != th) { CloseHandle(th); }
 			return TRUE;
-		case IDCANCEL:
-			EndDialog(hDlg, IDCANCEL); // 대화상자 닫기
-			closesocket(sock); // 소켓 닫기
+		}
+	
+		case IDC_FILE_BUTTON:
+		{
+			// 파일 경로를 얻어온다.
+			OPENFILENAME ofn;
+			wchar_t szFile[BUFSIZE / 2] = { 0 };
+			ZeroMemory(&ofn, sizeof(ofn));
+			ofn.lStructSize = sizeof(ofn);
+			ofn.hwndOwner = hDlg;
+			ofn.lpstrFile = szFile;
+			ofn.nMaxFile = sizeof(szFile);
+			ofn.lpstrFilter = L"All Files\0*.*\0Text Files\0*.TXT\0";
+			ofn.nFilterIndex = 1;
+			ofn.lpstrFileTitle = NULL;
+			ofn.nMaxFileTitle = 0;
+			ofn.lpstrInitialDir = NULL;
+			ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST;
+			if (GetOpenFileName(&ofn) == TRUE) {
+				// 파일 경로를 Edit에 보여주기
+				SetWindowText(hFileEdit, szFile);
+
+				// 파일 경로를 기존 코드에 맞게 string 형태로 저장
+				char szFileA[BUFSIZE];
+				WideCharToMultiByte(CP_ACP, 0, szFile, -1, szFileA, BUFSIZE / 2, NULL, NULL);
+				path = szFileA;
+
+				// 파일 이름을 저장
+				const wchar_t* szFilePath = PathFindFileName(szFile);
+				WideCharToMultiByte(CP_ACP, 0, szFilePath, -1, szFileA, BUFSIZE / 2, NULL, NULL);
+				filename = szFileA;
+			}
 			return TRUE;
+		}
+
+		case IDC_CANCEL_BUTTON:
+		{
+			EndDialog(hDlg, IDC_CANCEL_BUTTON); // 대화상자 닫기
+			if (NULL != sock) { closesocket(sock); }
+			return TRUE;
+		}
 		}
 		return FALSE;
 	}
@@ -78,36 +141,41 @@ INT_PTR CALLBACK DlgProc(HWND hDlg, UINT uMsg, WPARAM wParam, LPARAM lParam)
 }
 
 // 에디트 컨트롤 출력 함수
-void DisplayText(const char *fmt, ...)
+void displayText(const wchar_t *fmt)
 {
-	va_list arg;
-	va_start(arg, fmt);
-	char cbuf[BUFSIZE * 2];
-	vsprintf(cbuf, fmt, arg);
-	va_end(arg);
-
-	int nLength = GetWindowTextLength(hEdit2);
-	SendMessage(hEdit2, EM_SETSEL, nLength, nLength);
-	SendMessageA(hEdit2, EM_REPLACESEL, FALSE, (LPARAM)cbuf);
+	SetWindowText(hStatusEdit, fmt);
 }
 
-// 소켓 함수 오류 출력
-void DisplayError(const char *msg)
+// 파일 크기를 읽는 함수
+std::streampos getFileSize(std::ifstream& file)
 {
-	LPVOID lpMsgBuf;
-	FormatMessageA(
-		FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM,
-		NULL, WSAGetLastError(),
-		MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
-		(char *)&lpMsgBuf, 0, NULL);
-	DisplayText("[%s] %s\r\n", msg, (char *)lpMsgBuf);
-	LocalFree(lpMsgBuf);
+	file.seekg(0, std::ios::end);  // 파일의 마지막 위치로 이동.
+	auto fileSize = file.tellg();  // 현재 위치로 파일의 크기를 구함.
+	file.seekg(0, std::ios::beg);  // 다시 파일을 시작 위치로 이동.
+	return fileSize;
 }
 
-// TCP 클라이언트 시작 부분
-DWORD WINAPI ClientMain(LPVOID arg)
+// 보내는 함수
+void doSend(SOCKET socket, const char* buf, int len)
+{
+	int retval = send(socket, buf, len, 0);
+	if (SOCKET_ERROR == retval) {
+		err_display("send()");
+		exit(-1);
+	}
+}
+
+// 데이터 전송 함수
+DWORD WINAPI workerSend(LPVOID arg)
 {
 	int retval;
+
+	std::ifstream file(path, std::ios::binary);
+	if (not file) {
+		displayText(L"파일이 존재하지 않습니다.");
+		EnableWindow(hSendButton, TRUE);
+		return 1;
+	}
 
 	// 소켓 생성
 	sock = socket(AF_INET, SOCK_STREAM, 0);
@@ -117,47 +185,63 @@ DWORD WINAPI ClientMain(LPVOID arg)
 	struct sockaddr_in serveraddr;
 	memset(&serveraddr, 0, sizeof(serveraddr));
 	serveraddr.sin_family = AF_INET;
-	serveraddr.sin_addr.s_addr = inet_addr(SERVERIP);
+	serveraddr.sin_addr.s_addr = inet_addr(ipAddress);
 	serveraddr.sin_port = htons(SERVERPORT);
 	retval = connect(sock, (struct sockaddr *)&serveraddr, sizeof(serveraddr));
 	if (retval == SOCKET_ERROR) err_quit("connect()");
 
+	displayText(L"데이터 전송을 시작합니다.");
+
+	// 서버에게 파일 이름 보내기
+	int len = static_cast<int>(filename.size());
+
+	// 파일 이름의 크기를 보내기.
+	doSend(sock, (char*)&len, sizeof(int));
+
+	// 데이터 보내기(가변 길이)
+	doSend(sock, filename.c_str(), len);
+
+
+	// 저장할 데이터의 사이즈 보내기
+	maxSize = static_cast<double>(getFileSize(file));
+	doSend(sock, (char*)&maxSize, sizeof(double));
+	
+	currentSize = 0.;
+	int currentProgress{};
+
 	// 서버와 데이터 통신
-	while (1) {
-		WaitForSingleObject(hWriteEvent, INFINITE); // 쓰기 완료 대기
+	bool loop{ true };
+	while (loop) {
 
-		// 문자열 길이가 0이면 보내지 않음
-		if (strlen(buf) == 0) {
-			EnableWindow(hSendButton, TRUE); // 보내기 버튼 활성화
-			SetEvent(hReadEvent); // 읽기 완료 알림
-			continue;
+		// 데이터 입력(시뮬레이션)
+		if (not file.read(buf, BUFSIZE)) {
+			loop = false;
 		}
 
-		// 데이터 보내기
-		retval = send(sock, buf, (int)strlen(buf), 0);
-		if (retval == SOCKET_ERROR) {
-			DisplayError("send()");
-			break;
+		// 파일 길이 읽기
+		len = static_cast<int>(file.gcount());
+		if (0 == len) break;
+
+		// 데이터 보내기(고정 길이)
+		doSend(sock, (char*)&len, sizeof(int));
+
+		// 데이터 보내기(가변 길이)
+		doSend(sock, buf, len);
+
+		// 프로그레스 바 업데이트
+		currentSize += static_cast<double>(len);
+		auto val{ static_cast<int>(min(currentSize / maxSize * 100., 100.)) };
+		if (currentProgress < val) {
+			currentProgress = val;
+			SendMessage(hProgress, PBM_SETPOS, (WPARAM)currentProgress, 0);
 		}
-		DisplayText("[TCP 클라이언트] %d바이트를 보냈습니다.\r\n", retval);
-
-		// 데이터 받기
-		retval = recv(sock, buf, retval, MSG_WAITALL);
-		if (retval == SOCKET_ERROR) {
-			DisplayError("recv()");
-			break;
-		}
-		else if (retval == 0)
-			break;
-
-		// 받은 데이터 출력
-		buf[retval] = '\0';
-		DisplayText("[TCP 클라이언트] %d바이트를 받았습니다.\r\n", retval);
-		DisplayText("[받은 데이터] %s\r\n", buf);
-
-		EnableWindow(hSendButton, TRUE); // 보내기 버튼 활성화
-		SetEvent(hReadEvent); // 읽기 완료 알림
+		
 	}
+	displayText(L"전송이 완료되었습니다.");
 
+	// 소켓 닫기
+	closesocket(sock);
+	sock = NULL;
+	EnableWindow(hSendButton, TRUE);
 	return 0;
 }

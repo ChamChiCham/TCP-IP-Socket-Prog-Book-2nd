@@ -1,5 +1,6 @@
 #include <windows.h>
 #include <stdio.h>
+#include <atomic>
 
 DWORD WINAPI MyThread(LPVOID arg)
 {
